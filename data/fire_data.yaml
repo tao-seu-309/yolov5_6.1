@@ -1,0 +1,5 @@
+train: ../240429镔鑫/dataset_yolo_person/train/images
+val: ../240429镔鑫/dataset_yolo_person/valid/images
+
+nc: 1
+names: ['person']
