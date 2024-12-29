@@ -536,7 +536,7 @@ def labels_to_class_weights(labels, nc=80):
         return torch.Tensor()
 
     labels = np.concatenate(labels, 0)  # labels.shape = (866643, 5) for COCO
-    classes = labels[:, 0].astype(int)  # labels = [class xywh]
+    classes = labels[:, 0].astype(np.int64)  # labels = [class xywh]
     weights = np.bincount(classes, minlength=nc)  # occurrences per class
 
     # Prepend gridpoint count (for uCE training)
@@ -551,7 +551,7 @@ def labels_to_class_weights(labels, nc=80):
 
 def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
     # Produces image weights based on class_weights and image contents
-    class_counts = np.array([np.bincount(x[:, 0].astype(int), minlength=nc) for x in labels])
+    class_counts = np.array([np.bincount(x[:, 0].astype(np.int), minlength=nc) for x in labels])
     image_weights = (class_weights.reshape(1, nc) * class_counts).sum(1)
     # index = random.choices(range(n), weights=image_weights, k=1)  # weight image sample
     return image_weights
@@ -861,18 +861,40 @@ def apply_classifier(x, model, img, im0):
     return x
 
 
+# def increment_path(path, exist_ok=False, sep='', mkdir=False):
+#     # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
+#     path = Path(path)  # os-agnostic
+#     if path.exists() and not exist_ok:
+#         path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
+#         dirs = glob.glob(f"{path}{sep}*")  # similar paths
+#         matches = [re.search(rf"%s{sep}(\d+)" % path.stem, d) for d in dirs]
+#         i = [int(m.groups()[0]) for m in matches if m]  # indices
+#         n = max(i) + 1 if i else 2  # increment number
+#         path = Path(f"{path}{sep}{n}{suffix}")  # increment path
+#     if mkdir:
+#         path.mkdir(parents=True, exist_ok=True)  # make directory
+#     return path
 def increment_path(path, exist_ok=False, sep='', mkdir=False):
-    # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
-    path = Path(path)  # os-agnostic
+    # 如果路径已存在且exist_ok=False,则自动在路径后添加数字
+    path = Path(path)  # 转换为Path对象
+
     if path.exists() and not exist_ok:
+        # 如果是文件,分离文件名和后缀
         path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
-        dirs = glob.glob(f"{path}{sep}*")  # similar paths
+
+        # 查找类似的路径
+        dirs = glob.glob(f"{path}{sep}*")
+        # 找出路径中的数字
         matches = [re.search(rf"%s{sep}(\d+)" % path.stem, d) for d in dirs]
-        i = [int(m.groups()[0]) for m in matches if m]  # indices
-        n = max(i) + 1 if i else 2  # increment number
-        path = Path(f"{path}{sep}{n}{suffix}")  # increment path
+        i = [int(m.groups()[0]) for m in matches if m]
+
+        # 取最大数字+1,如果没有则为2
+        n = max(i) + 1 if i else 2
+        # 构建新路径
+        path = Path(f"{path}{sep}{n}{suffix}")
+
     if mkdir:
-        path.mkdir(parents=True, exist_ok=True)  # make directory
+        path.mkdir(parents=True, exist_ok=True)  # 创建目录
     return path
 
 

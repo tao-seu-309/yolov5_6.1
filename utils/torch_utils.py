@@ -34,6 +34,8 @@ warnings.filterwarnings('ignore', message='User provided device_type of \'cuda\'
 def torch_distributed_zero_first(local_rank: int):
     """
     Decorator to make all processes in distributed training wait for each local_master to do something.
+    dist.barrier() 是PyTorch中用于分布式训练的同步原语，它会阻塞进程直到所有进程都到达这个点。
+    如果不是主进程，设置这个点。如果是主进程，执行完with后续的事情也会到这个点。所以这个代码就会实现多进程同步。
     """
     if local_rank not in [-1, 0]:
         dist.barrier(device_ids=[local_rank])

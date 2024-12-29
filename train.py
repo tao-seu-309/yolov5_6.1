@@ -116,10 +116,22 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
 
     # Model
+    """
+    ## anchor ?
+    # 加载预训练权重参数文件到cpu：
+        当直接加载到GPU时，整个checkpoint（包括优化器状态、训练历史等）都会被加载到GPU内存中，
+        通过先加载到CPU，我们可以更好地控制什么时候将什么数据转移到GPU，
+        这样可以避免不必要的GPU内存占用，防止内存泄漏
+    # 模型先转成fp32：
+        模型训练时可能使用了混合精度训练(AMP)，权重可能是float16格式
+        某些操作可能需要float32精度
+        float()确保所有参数都转换为float32格式
+        state_dict()则获取模型的参数字典，便于后续加载
+    """
     check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
     if pretrained:
-        with torch_distributed_zero_first(LOCAL_RANK):
+        with torch_distributed_zero_first(LOCAL_RANK):  # 保证只在主进程加载数据，并实现同步不同进程
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
@@ -504,7 +516,7 @@ def main(opt, callbacks=Callbacks()):
         check_git_status()
         check_requirements(exclude=['thop'])
 
-    # Resume
+    # Resume 断点续训
     if opt.resume and not check_wandb_resume(opt) and not opt.evolve:  # resume an interrupted run
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
