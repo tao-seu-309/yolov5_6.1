@@ -29,6 +29,16 @@ def autobatch(model, imgsz=640, fraction=0.9, batch_size=16):
 
     prefix = colorstr('AutoBatch: ')
     LOGGER.info(f'{prefix}Computing optimal batch size for --imgsz {imgsz}')
+    """
+    # 方案1：转换为列表后取第一个（不推荐，因为会创建完整列表）
+    device = list(model.parameters())[0].device
+    
+    # 方案2：使用模型的device属性（不是所有模型都有这个属性）
+    device = model.device  # 可能会报错
+    
+    # 方案3：使用next（推荐，当前使用的方案）
+    device = next(model.parameters()).device
+    """
     device = next(model.parameters()).device  # get model device
     if device.type == 'cpu':
         LOGGER.info(f'{prefix}CUDA not detected, using default CPU batch-size {batch_size}')
@@ -41,11 +51,11 @@ def autobatch(model, imgsz=640, fraction=0.9, batch_size=16):
     a = torch.cuda.memory_allocated(device) / 1024 ** 3  # (GiB)
     f = t - (r + a)  # free inside reserved
     LOGGER.info(f'{prefix}{d} ({properties.name}) {t:.2f}G total, {r:.2f}G reserved, {a:.2f}G allocated, {f:.2f}G free')
-
+    # 通过不同bs拟合一条bs-占显存曲线，从而估算占显存0.9(fraction)时候bs设置为多少
     batch_sizes = [1, 2, 4, 8, 16]
     try:
         img = [torch.zeros(b, 3, imgsz, imgsz) for b in batch_sizes]
-        y = profile(img, model, n=3, device=device)
+        y = profile(img, model, n=3, device=device)     # (shape, time, memory)
     except Exception as e:
         LOGGER.warning(f'{prefix}{e}')
 

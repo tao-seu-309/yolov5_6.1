@@ -117,10 +117,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Model
     """
-    ## anchor ?
     # 加载预训练权重参数文件到cpu：
         当直接加载到GPU时，整个checkpoint（包括优化器状态、训练历史等）都会被加载到GPU内存中，
-        通过先加载到CPU，我们可以更好地控制什么时候将什么数据转移到GPU，
+        通过csd先加载到CPU，我们可以更好地控制什么时候将什么数据转移到GPU，
         这样可以避免不必要的GPU内存占用，防止内存泄漏
     # 模型先转成fp32：
         模型训练时可能使用了混合精度训练(AMP)，权重可能是float16格式
@@ -133,11 +132,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):  # 保证只在主进程加载数据，并实现同步不同进程
             weights = attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak  加载权重文件
+        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create  创建自己的模型
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect 加载的和自建的，取交集 （迁移学习）
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
@@ -151,7 +150,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             LOGGER.info(f'freezing {k}')
             v.requires_grad = False
 
-    # Image size
+    # Image size    确保imgsz可以被最大步长整除
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
@@ -166,8 +165,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
     LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
+    # 将模型参数分为三组(批归一化的weight、卷积层weights、biases)来进行分组优化
     g0, g1, g2 = [], [], []  # optimizer parameter groups
-    for v in model.modules():
+    for v in model.modules():   # 类似于深度优先遍历 Model -> Sequential -> Conv -> conv -> bn -> act -> Conv ...
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
             g2.append(v.bias)
         if isinstance(v, nn.BatchNorm2d):  # weight (no decay)
@@ -184,18 +184,39 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     optimizer.add_param_group({'params': g1, 'weight_decay': hyp['weight_decay']})  # add g1 with weight_decay
     optimizer.add_param_group({'params': g2})  # add g2 (biases)
+    """
+    # 主要方法
+    optimizer.zero_grad()       # 清零梯度
+    optimizer.step()            # 更新参数
+    optimizer.state_dict()      # 获取优化器状态
+    optimizer.load_state_dict() # 加载优化器状态
+    
+    # 属性访问
+    optimizer.param_groups      # 参数组列表
+    optimizer.state             # 优化器状态字典
+    
+    # 参数组操作
+    optimizer.add_param_group() # 添加新的参数组
+    """
     LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
                 f"{len(g0)} weight (no decay), {len(g1)} weight, {len(g2)} bias")
     del g0, g1, g2
+
 
     # Scheduler
     if opt.cos_lr:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
     else:
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+    # 在此处传入optimizer以便后续更新lr
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
+    """
+    # RANK = -1: 单GPU训练或CPU训练
+    # RANK = 0:  分布式训练中的主进程
+    # RANK > 0:  分布式训练中的其他进程
+    """
     ema = ModelEMA(model) if RANK in [-1, 0] else None
 
     # Resume
@@ -257,9 +278,10 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             if plots:
                 plot_labels(labels, names, save_dir)
 
-            # Anchors
+            # Anchors kmeans自动画框？？
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+            # 将模型转换为半精度（fp16），并恢复为float32精度，节省一些计算资源
             model.half().float()  # pre-reduce anchor precision
 
         callbacks.run('on_pretrain_routine_end')
@@ -270,6 +292,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
+    # 以3通道640图像，coco数据集（80类）为基准缩放
     hyp['box'] *= 3 / nl  # scale to layers
     hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
@@ -287,6 +310,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
+
     scaler = amp.GradScaler(enabled=cuda)
     stopper = EarlyStopping(patience=opt.patience)
     compute_loss = ComputeLoss(model)  # init loss class
@@ -299,7 +323,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
-            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
+            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights 将mAP转换为权重调整因子,精度低发类权重高
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
             dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
 
@@ -318,11 +342,20 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+            """
+            Warmup在batch级别进行更频繁的调整
+            在warmup阶段，它的调整会覆盖scheduler的设置
+            """
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+                """
+                nbs = 64, batch_size = 16, 则nbs / batch_size = 4, 那么accumulate会从1逐渐增加到4：
+                迭代开始: accumulate = 1 (每个batch都更新)
+                warmup中期: accumulate = 2 (累积2个batch更新一次)
+                warmup结束: accumulate = 4 (累积4个batch更新一次)
+                """
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
@@ -341,16 +374,18 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
+                # loss_items每项损失分别为加权后的 预测框损失 置信度损失 分类损失
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
+                if opt.quad:    # 四重数据增强:一种特殊的数据增强策略，每个图像会被处理成4个版本
                     loss *= 4.
 
             # Backward
             scaler.scale(loss).backward()
 
             # Optimize
+            # 这里会对多批数据进行累积, 只有达到累计次数的时候才会更新参数
             if ni - last_opt_step >= accumulate:
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
@@ -438,7 +473,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
         for f in last, best:
             if f.exists():
-                strip_optimizer(f)  # strip optimizers
+                strip_optimizer(f)  # strip optimizers 减小模型体积，加快模型加载速度，避免训练相关信息泄露
                 if f is best:
                     LOGGER.info(f'\nValidating {f}...')
                     results, _, _ = val.run(data_dict,
@@ -474,7 +509,7 @@ def parse_opt(known=False):
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
-    parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
+    parser.add_argument('--resume', nargs='?', const=True, default="False", help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--noval', action='store_true', help='only validate final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable AutoAnchor')
@@ -506,6 +541,12 @@ def parse_opt(known=False):
     parser.add_argument('--artifact_alias', type=str, default='latest', help='W&B: Version of dataset artifact to use')
 
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
+    """
+    # 当known=True时
+    opt = parser.parse_known_args()[0]  # 只解析已知的参数，忽略未知参数
+    # 当known=False时
+    opt = parser.parse_args()  # 解析所有参数，遇到未知参数会报错
+    """
     return opt
 
 
@@ -513,8 +554,8 @@ def main(opt, callbacks=Callbacks()):
     # Checks
     if RANK in [-1, 0]:
         print_args(FILE.stem, opt)
-        check_git_status()
-        check_requirements(exclude=['thop'])
+        # check_git_status()
+        # check_requirements(exclude=['thop'])
 
     # Resume 断点续训
     if opt.resume and not check_wandb_resume(opt) and not opt.evolve:  # resume an interrupted run
@@ -557,6 +598,7 @@ def main(opt, callbacks=Callbacks()):
     # Evolve hyperparameters (optional)
     else:
         # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
+        # 取值范围: 0-1。  0: 参数不太需要突变, 1: 参数需要较大范围的突变
         meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
                 'lrf': (1, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
                 'momentum': (0.3, 0.6, 0.98),  # SGD momentum/Adam beta1
@@ -603,12 +645,13 @@ def main(opt, callbacks=Callbacks()):
                 parent = 'single'  # parent selection method: 'single' or 'weighted'
                 x = np.loadtxt(evolve_csv, ndmin=2, delimiter=',', skiprows=1)
                 n = min(5, len(x))  # number of previous results to consider
-                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                w = fitness(x) - fitness(x).min() + 1E-6  # weights (sum > 0)
-                if parent == 'single' or len(x) == 1:
-                    # x = x[random.randint(0, n - 1)]  # random selection
-                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
-                elif parent == 'weighted':
+                # 使用[P, R, mAP@0.5, mAP@0.5:0.95]作为计算适应度函数的指标（实际上只有mAP有权重）
+                x = x[np.argsort(-fitness(x))][:n]        # top n mutations, x是top n的参数列表
+                w = fitness(x) - fitness(x).min() + 1E-6  # weights (sum > 0) 最小值设为1E-6, 含n个数据的一维数组
+                if parent == 'single' or len(x) == 1:     # 父代中随机选择一个
+                    # x = x[random.randint(0, n - 1)]     # random selection
+                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection , x = x[chosen_idx]
+                elif parent == 'weighted':                # 父代加权求和再平均
                     x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
 
                 # Mutate
@@ -619,8 +662,24 @@ def main(opt, callbacks=Callbacks()):
                 ng = len(meta)
                 v = np.ones(ng)
                 while all(v == 1):  # mutate until a change occurs (prevent duplicates)
+                    """
+                    # 生成突变系数v
+                    v = (g *                     # 参数的突变系数 (0-1)
+                         (npr.random(ng) < mp) * # 是否突变的布尔掩码 (True/False)
+                         npr.randn(ng) *         # 生成ng个范围在[0.0, 1.0)的随机数
+                         npr.random() *          # 均匀分布随机数 [0.0, 1.0)
+                         s +                     # 突变强度系数sigma (0.2)
+                         1                       # 基准值
+                        ).clip(0.3, 3.0)         # 限制范围
+                    """
                     v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
                 for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
+                    """
+                    x是从evolve.csv加载的数据，每行的格式如下：
+                    [metrics(7个) | hyperparameters(27个)]
+                    前7个值是: [P, R, mAP@0.5, mAP@0.5:0.95, val_loss(box, obj, cls)]
+                    后面的值是所有超参数
+                    """
                     hyp[k] = float(x[i + 7] * v[i])  # mutate
 
             # Constrain to limits
@@ -644,6 +703,12 @@ def main(opt, callbacks=Callbacks()):
 
 def run(**kwargs):
     # Usage: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolov5m.pt')
+    """
+    # 当known=True时
+    opt = parser.parse_known_args()[0]  # 只解析已知的参数，忽略未知参数
+    # 当known=False时
+    opt = parser.parse_args()  # 解析所有参数，遇到未知参数会报错
+    """
     opt = parse_opt(True)
     for k, v in kwargs.items():
         setattr(opt, k, v)

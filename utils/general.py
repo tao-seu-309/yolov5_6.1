@@ -171,6 +171,7 @@ def init_seeds(seed=0):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    # 是否根据当前配置为当前硬件选择最快的卷积算法，是否确保每次运行产生相同的结果
     cudnn.benchmark, cudnn.deterministic = (False, True) if seed == 0 else (True, False)
 
 
@@ -543,7 +544,7 @@ def labels_to_class_weights(labels, nc=80):
     # gpi = ((320 / 32 * np.array([1, 2, 4])) ** 2 * 3).sum()  # gridpoints per image
     # weights = np.hstack([gpi * len(labels)  - weights.sum() * 9, weights * 9]) ** 0.5  # prepend gridpoints to start
 
-    weights[weights == 0] = 1  # replace empty bins with 1
+    weights[weights == 0] = 1  # replace empty bins with 1 布尔索引
     weights = 1 / weights  # number of targets per class
     weights /= weights.sum()  # normalize
     return torch.from_numpy(weights)

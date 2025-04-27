@@ -91,6 +91,7 @@ def exif_transpose(image):
     return image
 
 
+
 def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
                       rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False):
     if rect and shuffle:
@@ -112,6 +113,7 @@ def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=Non
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
+    # DataLoader每个 epoch 结束后重新开采样, 支持动态调整采样权重, 适用于 image_weights=True 的情况
     loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
     return loader(dataset,
                   batch_size=batch_size,
@@ -440,7 +442,7 @@ class LoadImagesAndLabels(Dataset):
         self.img_files = list(cache.keys())  # update
         self.label_files = img2label_paths(cache.keys())  # update
         n = len(shapes)  # number of images
-        bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int64)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
@@ -482,7 +484,7 @@ class LoadImagesAndLabels(Dataset):
                 elif mini > 1:
                     shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int64) * stride
 
         # Cache images into RAM/disk for faster training (WARNING: large datasets may exceed system resources)
         self.imgs, self.img_npy = [None] * n, [None] * n
@@ -500,7 +502,7 @@ class LoadImagesAndLabels(Dataset):
                     if not self.img_npy[i].exists():
                         np.save(self.img_npy[i].as_posix(), x[0])
                     gb += self.img_npy[i].stat().st_size
-                else:  # 'ram'
+                else:  # 'ram' 直接放在self.imgs数组里面
                     self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
                     gb += self.imgs[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
@@ -777,6 +779,21 @@ class LoadImagesAndLabels(Dataset):
 
     @staticmethod
     def collate_fn(batch):
+        """
+        这个函数会在create_dataloader中生成dataloader时调用：
+        整理函数  将image和label整合到一起
+        :return torch.stack(img, 0): 如[16, 3, 640, 640] 整个batch的图片
+        :return torch.cat(label, 0): 如[15, 6] [num_target, img_index+class_index+xywh(normalized)] 整个batch的label
+        :return path: 整个batch所有图片的路径
+        :return shapes: (h0, w0), ((h / h0, w / w0), pad)    for COCO mAP rescaling
+        pytorch的DataLoader打包一个batch的数据集时要经过此函数进行打包 通过重写此函数实现标签与图片对应的划分，一个batch中哪些标签属于哪一张图片,形如
+            [[0, 6, 0.5, 0.5, 0.26, 0.35],
+             [0, 6, 0.5, 0.5, 0.26, 0.35],
+             [1, 6, 0.5, 0.5, 0.26, 0.35],
+             [2, 6, 0.5, 0.5, 0.26, 0.35],]
+           前两行标签属于第一张图片, 第三行属于第二张。
+        注意：这个函数一般是当调用了batch_size次 getitem 函数后才会调用一次这个函数，对batch_size张图片和对应的label进行打包。
+        """
         img, label, path, shapes = zip(*batch)  # transposed
         for i, lb in enumerate(label):
             lb[:, 0] = i  # add target image index for build_targets()
@@ -852,7 +869,7 @@ def extract_boxes(path=DATASETS_DIR / 'coco128'):  # from utils.datasets import 
                     b = x[1:] * [w, h, w, h]  # box
                     # b[2:] = b[2:].max()  # rectangle to square
                     b[2:] = b[2:] * 1.2 + 3  # pad
-                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(int)
+                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int64)
 
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)

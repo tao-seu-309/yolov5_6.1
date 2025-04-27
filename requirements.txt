@@ -1,8 +1,8 @@
 # packages in environment at /storage/chb/CondaEnv/py38_env:
 #
 # Name                    Version                   Build  Channel
-_libgcc_mutex             0.1                        main    https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
-_openmp_mutex             5.1                       1_gnu    https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+# 
+
 absl-py                   2.0.0                    pypi_0    pypi
 appdirs                   1.4.4                    pypi_0    pypi
 ca-certificates           2023.08.22           h06a4308_0    https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
